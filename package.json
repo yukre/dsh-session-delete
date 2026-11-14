@@ -1,0 +1,51 @@
+{
+  "name": "dsh-session-delete",
+  "version": "1.0.0",
+  "description": "Permanently delete a session and its conversation log from the sidebar session menu; archive stays a separate, reversible action.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yukre/dsh-session-delete.git"
+  },
+  "homepage": "https://github.com/yukre/dsh-session-delete#readme",
+  "bugs": {
+    "url": "https://github.com/yukre/dsh-session-delete/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "delete",
+    "session-management"
+  ],
+  "author": "yukre",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session delete",
+    "description": "Adds “Delete session” to the session context menu and permanently removes that session and its conversation log. Archive stays a separate, reversible action."
+  }
+}

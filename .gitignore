@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+._*
+
+# Dependencies
+node_modules/
+pnpm-lock.yaml
+
+# Logs and temp files
+*.log
+*.tmp
