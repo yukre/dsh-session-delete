@@ -140,5 +140,54 @@ const exists = async p => { try { const { stat } = await import('node:fs/promise
   await frm(tmp, { recursive: true, force: true })
 }
 
-console.log(`\n════════ 结果：${pass} 通过 / ${fail} 失败 ════════`)
+
+// 场景6：同一 id 出现在两个 bucket → 只删一个，另一个必须保留
+{
+  console.log('\n─── 场景6 同名会话只删一个（不扩散）───')
+  const tmp = await mkdtemp(join(tmpdir(), 'dsd-dup-'))
+  const root = join(tmp, 'sessions')
+  const SID = 'session-dup-copy-0003'
+  const BUCKET_A = '--proj-a--'
+  const BUCKET_B = '--proj-b--'
+  for (const b of [BUCKET_A, BUCKET_B]) {
+    await mkdir(join(root, b, SID), { recursive: true })
+    await writeFile(join(root, b, SID, 'session.v4.jsonl.zstd'), 'log')
+  }
+  const cacheDir = join(tmp, 'storages', 'session_projcache', 'sessions')
+  await mkdir(cacheDir, { recursive: true })
+  await writeFile(join(cacheDir, `${SID}.json`), '{"version":7}')
+  const tables = { ws: { path: '/p', title: 'P', sessionIds: [SID], createdAt: 'a', updatedAt: 'a' } }
+  const ledger = { initialized: true, workspaceIds: ['ws'], archivedSessionIds: [], pinnedSessionIds: [], defaultWorkspaceId: 'ws' }
+  await writeFile(join(tmp, 'storages', 'workspace.json'), JSON.stringify({ unit: { name: 'workspace', version: 2 }, global: ledger, tables: { workspaces: tables } }))
+
+  let handler
+  const warns = []
+  const logger = { info() {}, warn(m) { warns.push(String(m)) } }
+  const wsTable = { get: k => tables[k], update: async (k, fn) => { tables[k] = fn(tables[k]); return tables[k] } }
+  const wsDomain = { table: () => wsTable, global: { get: () => ledger, set: async v => Object.assign(ledger, v) } }
+  const cacheDomain = { get: k => k === SID ? {} : undefined, delete: async k => { try { await frm(join(cacheDir, `${k}.json`)); return true } catch { return false } } }
+  const router = { get: n => n === 'workspace' ? wsDomain : n === 'session_projcache' ? cacheDomain : undefined }
+  const mk = () => ({ logger, get: n => n === 'storageDomain' ? router : undefined,
+    effect(f) { f() }, emit() {}, parallel: async () => [],
+    inject(_n, fn) { fn(mk()) }, webServer: { register(r) { handler = r.handler; return () => {} } } })
+  mod.apply(mk(), { sessionsRoot: root })
+  let done; const p = new Promise(r => done = r)
+  const res = { statusCode: 200, setHeader() {}, end(t) { done({ status: this.statusCode, body: t }) } }
+  const req = Readable.from([Buffer.from(JSON.stringify({ sessionId: SID }))])
+  req.method = 'POST'; req.headers = { 'content-type': 'application/json' }
+  await handler(req, res)
+  const body = JSON.parse((await p).body)
+
+  const aExists = await exists(join(root, BUCKET_A, SID))
+  const bExists = await exists(join(root, BUCKET_B, SID))
+  check('只删了其中一个（另一个保留）', aExists !== bExists, `A=${aExists} B=${bExists}`)
+  check('确实有一个被删掉', !aExists || !bExists)
+  check('返回成功', body.ok === true, JSON.stringify(body))
+  check('报告了未处理的副本', Array.isArray(body.untouchedDuplicates) && body.untouchedDuplicates.length === 1, JSON.stringify(body))
+  check('记录了警告日志', warns.some(w => w.includes('other bucket') || w.includes('copies')), JSON.stringify(warns))
+  check('缓存已清理（按 id 清，与副本无关）', !(await exists(join(cacheDir, `${SID}.json`))))
+  await frm(tmp, { recursive: true, force: true })
+}
+
+console.log(`\n════════ 最终：${pass} 通过 / ${fail} 失败 ════════`)
 process.exit(fail === 0 ? 0 : 1)
