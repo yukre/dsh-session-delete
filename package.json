@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-delete",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Permanently delete a session and its conversation log from the sidebar session menu; archive stays a separate, reversible action.",
   "type": "module",
   "main": "lib/index.js",
@@ -43,7 +43,8 @@
       "platform": "web",
       "immediately": true,
       "inject": [
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-context-menu"
       ]
     }
   },
