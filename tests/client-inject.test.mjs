@@ -23,7 +23,7 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /** Context members the host provides without them appearing in `inject`. */
 const ALWAYS_PRESENT = new Set([
   'effect', 'inject', 'get', 'provide', 'on', 'emit', 'waterfall',
-  'logger', 'slots', 'locale', 'remote', 'remoteAccess',
+  'logger', 'locale', 'remote', 'remoteAccess',
 ])
 
 /**
@@ -67,42 +67,69 @@ function usedContextMembers() {
   return [...names].sort()
 }
 
-test('every ctx member the client uses is declared in inject', () => {
+test('every ctx member the client uses is either injected or read through ctx.get', () => {
   const module = loadClientModule()
   const declared = new Set([...(module.inject ?? [])])
+  const source = readFileSync(join(packageRoot, 'lib/client.js'), 'utf8')
+  // A service reached via ctx.get('name') is checked at the call site, so it does
+  // not need an inject entry — and for a service the Client catalog does not
+  // list (contextMenus), inject cannot resolve it anyway.
+  const viaGet = new Set([...source.matchAll(/ctx\.get\(\s*['"]([\w$]+)['"]/g)].map(m => m[1]))
   const missing = usedContextMembers()
-    .filter(name => !declared.has(name) && !ALWAYS_PRESENT.has(name))
+    .filter(name => !declared.has(name) && !ALWAYS_PRESENT.has(name) && !viaGet.has(name))
   assert.deepEqual(
     missing,
     [],
-    `lib/client.js reads ctx.${missing.join(', ctx.')} but inject is ${JSON.stringify([...declared])};`
-    + ' an undeclared service is undefined at apply time and takes the plugin down',
+    `lib/client.js reads ctx.${missing.join(', ctx.')}, but inject is ${JSON.stringify([...declared])}`
+    + ' and it is not read through a checked ctx.get(); reading it directly is undefined at apply time',
   )
 })
 
-test('the client module survives apply with only its declared services', () => {
-  const module = loadClientModule()
-  const declared = new Set([...(module.inject ?? [])])
-  // Build a context that offers exactly what was declared, nothing more, so an
-  // undeclared dependency shows up as a throw rather than being papered over.
+/**
+ * Build a Client context shaped like the real one.
+ *
+ * The dynamic Client ctx exposes ctx.get / ctx.on / ctx.provide / ctx.effect,
+ * and the services a plugin declares in `inject` land on it directly — the
+ * working third-party plugins do rely on `ctx.slots` being present. Services
+ * NOT listed in the Client Service catalog (contextMenus is one) are still
+ * reachable through ctx.get.
+ * @param options - which optional services to provide.
+ * @returns a context plus a getter for the captured menu contribution.
+ */
+function clientContext(options = {}) {
+  let contribution
+  const services = {
+    contextMenus: options.withContextMenus === false
+      ? undefined
+      : { register: value => { contribution = value; return () => {} } },
+  }
   const context = {
-    effect: fn => { fn() },
+    get: name => services[name],
+    on: () => () => {},
+    provide: () => () => {},
+    effect: fn => { const dispose = fn(); return dispose ?? (() => {}) },
     slots: { inject: (name, cb) => cb(), register: () => () => {} },
   }
-  if (declared.has('contextMenus')) {
-    context.contextMenus = { register: () => () => {} }
-  }
-  assert.doesNotThrow(() => { module.apply(context) })
+  return { context, contribution: () => contribution }
+}
+
+test('the client module survives apply against a real-shaped context', () => {
+  const module = loadClientModule()
+  assert.doesNotThrow(() => { module.apply(clientContext().context) })
+})
+
+test('a missing optional service degrades instead of taking the plugin down', () => {
+  const module = loadClientModule()
+  // contextMenus is provided by another plugin. If it is absent, the row is
+  // skipped — but apply must NOT throw, or the whole plugin unloads.
+  assert.doesNotThrow(() => { module.apply(clientContext({ withContextMenus: false }).context) })
 })
 
 test('the menu contribution is ordered after the built-in Archive row', () => {
   const module = loadClientModule()
-  let contribution
-  module.apply({
-    effect: fn => { fn() },
-    contextMenus: { register: value => { contribution = value; return () => {} } },
-    slots: { inject: (name, cb) => cb(), register: () => () => {} },
-  })
+  const built = clientContext()
+  module.apply(built.context)
+  const contribution = built.contribution()
   assert.ok(contribution !== undefined, 'the client registered no menu contribution')
   assert.equal(contribution.target, 'session')
   // Archive contributes at 600 and reserves the footer; both must hold here.
