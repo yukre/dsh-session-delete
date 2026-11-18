@@ -390,6 +390,45 @@ test('a JSON body that is not an object is a 400, never a 500', async (t) => {
   }
 })
 
+test('a malformed or oversized body answers in plain language', async (t) => {
+  // The parser's message ("Expected property name or '}' in JSON at position 1")
+  // is a JavaScript runtime string, not part of this API's contract. Callers get
+  // one of two named causes instead.
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+  let handler
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: () => undefined,
+    emit() {},
+    effect(fn) { fn() },
+    async parallel() {},
+    inject(_names, fn) { fn(this) },
+    webServer: { register(route) { handler = route.handler; return () => {} } },
+  }
+  applyPlugin(ctx, { sessionsRoot: await mkdtemp(join(tmpdir(), 'dsd-body-')) })
+
+  const call = body => new Promise(resolve => {
+    const res = { statusCode: 200, setHeader() {}, end(text) { resolve({ status: this.statusCode, body: text }) } }
+    const req = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:8080' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(body) },
+    }
+    handler(req, res)
+  })
+
+  const broken = await call('{broken')
+  assert.equal(broken.status, 400)
+  assert.equal(JSON.parse(broken.body).code, 'BAD_BODY')
+  // No JavaScript parser text reaches the caller.
+  assert.equal(/position|Expected|Unexpected|JSON at/.test(broken.body), false, broken.body)
+
+  const huge = await call(`{"sessionId":"${'a'.repeat(20000)}"}`)
+  assert.equal(huge.status, 400)
+  assert.equal(JSON.parse(huge.body).code, 'BODY_TOO_LARGE')
+  assert.equal(/body too large/.test(huge.body), false, huge.body)
+})
+
 test('two concurrent deletions of one session announce it once', async (t) => {
   // Without de-duplication both requests passed the guards, both removed, and
   // both announced — a subscriber then saw a second "removed" for an id that
@@ -479,4 +518,58 @@ test('a filesystem failure answers without leaking the internal path', async (t)
   assert.equal(answer.body.includes(root), false, `the message leaks the path: ${parsed.message}`)
   assert.equal(/EACCES|EPERM|unlink|ENOENT/.test(parsed.message), false, parsed.message)
   assert.match(parsed.message, /权限|出错/)
+})
+
+test('a workspace record missing from the index still loses the stale id', async (t) => {
+  // The ledger pass exists to remove a deleted session id from every workspace
+  // record. Keying off `global.workspaceIds` skips a record that outlived its
+  // index entry — an older profile, a hand-edited file, a half-applied write —
+  // and leaves exactly the orphan this pass is for.
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+  const root = await mkdtemp(join(tmpdir(), 'dsd-ledger-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const SID = 'session-orphaned-ledger-1'
+  const bucket = join(root, '--proj--')
+  await mkdir(join(bucket, SID), { recursive: true })
+  await writeFile(join(bucket, SID, 'session.v4.jsonl.zstd'), 'log')
+
+  // The record exists in the table; the index does not mention it.
+  const tables = {
+    'in-index': { path: '/a', title: 'A', sessionIds: [SID], createdAt: 'a', updatedAt: 'a' },
+    'not-in-index': { path: '/b', title: 'B', sessionIds: [SID], createdAt: 'b', updatedAt: 'b' },
+  }
+  const ledger = { initialized: true, workspaceIds: ['in-index'], archivedSessionIds: [SID], pinnedSessionIds: [], defaultWorkspaceId: 'in-index' }
+  const table = {
+    get: key => tables[key],
+    keys: () => Object.keys(tables)[Symbol.iterator](),
+    update: async (key, fn) => { tables[key] = fn(tables[key]); return tables[key] },
+  }
+  const domain = { table: () => table, global: { get: () => ledger, set: async v => Object.assign(ledger, v) } }
+
+  let handler
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: name => (name === 'storageDomain' ? { get: n => (n === 'workspace' ? domain : undefined) } : undefined),
+    emit() {},
+    effect(fn) { fn() },
+    async parallel() {},
+    inject(_names, fn) { fn(this) },
+    webServer: { register(route) { handler = route.handler; return () => {} } },
+  }
+  applyPlugin(ctx, { sessionsRoot: root })
+
+  await new Promise(resolve => {
+    const res = { statusCode: 200, setHeader() {}, end() { resolve() } }
+    const req = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:8080' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ sessionId: SID })) },
+    }
+    handler(req, res)
+  })
+
+  assert.equal(tables['in-index'].sessionIds.includes(SID), false, 'the indexed record is cleaned')
+  assert.equal(tables['not-in-index'].sessionIds.includes(SID), false, 'the unindexed record is cleaned too')
+  // The registry-global sets are corrected on the same pass.
+  assert.equal(ledger.archivedSessionIds.includes(SID), false)
 })
