@@ -347,3 +347,88 @@ test('the bucket scan skips a directory that only shares the name', async (t) =>
   assert.ok(real.dir !== undefined, 'a genuine session directory is still found')
   assert.equal(real.dir.endsWith('session-real'), true)
 })
+
+/* ------------------------------------------------------------------ *
+ * 4. Request shape and duplicate requests
+ *
+ * Both are about answering honestly: a malformed body is the caller's mistake
+ * (400), not ours (500 with a JavaScript message), and a second request for a
+ * session already being deleted must not announce a second removal.
+ * ------------------------------------------------------------------ */
+
+test('a JSON body that is not an object is a 400, never a 500', async (t) => {
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+  let handler
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: () => undefined,
+    emit() {},
+    effect(fn) { fn() },
+    async parallel() {},
+    inject(_names, fn) { fn(this) },
+    webServer: { register(route) { handler = route.handler; return () => {} } },
+  }
+  applyPlugin(ctx, { sessionsRoot: await mkdtemp(join(tmpdir(), 'dsd-shape-')) })
+
+  const call = (payload) => new Promise(resolve => {
+    const res = { statusCode: 200, setHeader() {}, end(text) { resolve({ status: this.statusCode, body: text }) } }
+    const req = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:8080' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(payload) },
+    }
+    handler(req, res)
+  })
+
+  for (const payload of ['null', '[]', '"str"', '123', 'true']) {
+    const answer = await call(payload)
+    assert.equal(answer.status, 400, `${payload} must be a 400, got ${answer.status}`)
+    const parsed = JSON.parse(answer.body)
+    assert.equal(parsed.code, 'BAD_BODY_SHAPE')
+    // No internal detail leaks: the message must not mention JavaScript errors.
+    assert.equal(/Cannot read|undefined|TypeError/.test(parsed.message), false, parsed.message)
+  }
+})
+
+test('two concurrent deletions of one session announce it once', async (t) => {
+  // Without de-duplication both requests passed the guards, both removed, and
+  // both announced — a subscriber then saw a second "removed" for an id that
+  // was already gone and could not tell it from a real second deletion.
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+  const root = await mkdtemp(join(tmpdir(), 'dsd-dupdel-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const SID = 'session-concurrent-0001'
+  const bucket = join(root, '--proj--')
+  await mkdir(join(bucket, SID), { recursive: true })
+  await writeFile(join(bucket, SID, 'session.v4.jsonl.zstd'), 'log')
+
+  const events = []
+  let handler
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: () => undefined,
+    emit(name) { events.push(name) },
+    effect(fn) { fn() },
+    async parallel() {},
+    inject(_names, fn) { fn(this) },
+    webServer: { register(route) { handler = route.handler; return () => {} } },
+  }
+  applyPlugin(ctx, { sessionsRoot: root })
+
+  const call = () => new Promise(resolve => {
+    const res = { statusCode: 200, setHeader() {}, end(text) { resolve({ status: this.statusCode, body: text }) } }
+    const req = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:8080' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ sessionId: SID })) },
+    }
+    handler(req, res)
+  })
+
+  const [a, b] = await Promise.all([call(), call()])
+  // Both callers get the same honest answer: it is gone.
+  assert.equal(JSON.parse(a.body).ok, true)
+  assert.equal(JSON.parse(b.body).ok, true)
+  assert.equal(events.filter(n => n === 'session-delete/removed').length, 1, events.join(','))
+  assert.equal(events.filter(n => n === 'api-session/removed').length, 1, events.join(','))
+})
