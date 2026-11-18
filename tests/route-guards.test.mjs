@@ -166,8 +166,12 @@ test('a bogus id is refused before the filesystem is touched', async () => {
  * therefore cancels and drains the holder first.
  * ------------------------------------------------------------------ */
 
-test('a live agent is cancelled and drained before its directory is removed', async (t) => {
-  const { findSessionDir: _f, apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+test('an idle live agent is drained and NOT cancelled before removal', async (t) => {
+  // An idle resident Agent (a chat bridge keeps one for every session) must
+  // reach quiescence on its own. Cancelling it would break a session the user
+  // is merely tidying up, and if the removal later aborted the session would be
+  // cancelled for nothing.
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
   const root = await mkdtemp(join(tmpdir(), 'dsd-retire-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const SID = 'session-retire-0001'
@@ -180,6 +184,7 @@ test('a live agent is cancelled and drained before its directory is removed', as
   const agent = {
     status: 'idle',
     cancel(cause) { events.push(`cancel:${cause.kind}`) },
+    // An idle agent returns immediately.
     async whenIdle() { events.push('idle') },
   }
   const ctx = {
@@ -212,13 +217,65 @@ test('a live agent is cancelled and drained before its directory is removed', as
   const answer = JSON.parse((await settled).body)
 
   assert.equal(answer.ok, true, JSON.stringify(answer))
-  // Order matters: cancel, then drain, then release providers — all before rm.
-  assert.deepEqual(events.slice(0, 3), ['cancel:disposed', 'idle', 'parallel'])
+  // Drained first, released second — and never cancelled, because it was idle.
+  assert.deepEqual(events.slice(0, 2), ['idle', 'parallel'])
+  assert.equal(events.some(e => e.startsWith('cancel:')), false, 'an idle agent must not be cancelled')
   // Both audiences are told, ours first.
   assert.ok(events.includes('emit:session-delete/removed'), 'the plugin-owned event must fire')
   assert.ok(events.includes('emit:api-session/removed'), "DSH's UI notification must fire")
   const remaining = await readdir(bucket).catch(() => [])
   assert.deepEqual(remaining, [], 'the session directory is gone')
+})
+
+test('a wedged agent times out instead of hanging the delete forever', async (t) => {
+  // The route runs inside an HTTP request the user is watching. A holder that
+  // never settles must not turn "delete" into an unanswerable spinner: the wait
+  // is bounded, and the removal then proceeds.
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+  const root = await mkdtemp(join(tmpdir(), 'dsd-wedged-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const SID = 'session-wedged-0001'
+  const bucket = join(root, '--proj--')
+  await mkdir(join(bucket, SID), { recursive: true })
+  await writeFile(join(bucket, SID, 'session.v4.jsonl.zstd'), 'log')
+
+  let handler
+  const events = []
+  const agent = {
+    status: 'idle',
+    cancel() { events.push('cancel') },
+    whenIdle() { return new Promise(() => {}) },   // never settles
+  }
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: name => (name === 'agents' ? { get: id => (id === SID ? agent : undefined) } : undefined),
+    emit() {},
+    effect(fn) { fn() },
+    async parallel() {},
+    inject(_names, fn) { fn(this) },
+    webServer: { register(route) { handler = route.handler; return () => {} } },
+  }
+  applyPlugin(ctx, { sessionsRoot: root })
+
+  let done
+  const settled = new Promise(resolve => { done = resolve })
+  const res = { statusCode: 200, setHeader() {}, end(text) { done({ status: this.statusCode, body: text }) } }
+  const req = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', host: '127.0.0.1:8080' },
+    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ sessionId: SID })) },
+  }
+  const started = Date.now()
+  await handler(req, res)
+  const answer = JSON.parse((await settled).body)
+  const elapsed = Date.now() - started
+
+  assert.equal(answer.ok, true, JSON.stringify(answer))
+  // It gave up waiting and stopped the agent instead of blocking on it.
+  assert.equal(events.includes('cancel'), true, 'a wedged agent is cancelled after the budget')
+  assert.ok(elapsed < 15000, `the request must stay bounded, took ${elapsed}ms`)
+  const remaining = await readdir(bucket).catch(() => [])
+  assert.deepEqual(remaining, [])
 })
 
 test('a running agent still refuses deletion instead of cancelling work', async (t) => {
