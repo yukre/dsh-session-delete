@@ -26,7 +26,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readdir, rm, chmod } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -431,4 +431,52 @@ test('two concurrent deletions of one session announce it once', async (t) => {
   assert.equal(JSON.parse(b.body).ok, true)
   assert.equal(events.filter(n => n === 'session-delete/removed').length, 1, events.join(','))
   assert.equal(events.filter(n => n === 'api-session/removed').length, 1, events.join(','))
+})
+
+test('a filesystem failure answers without leaking the internal path', async (t) => {
+  // The message is rendered in the confirmation dialog. An absolute path there
+  // tells the user nothing actionable and exposes their directory layout, so a
+  // failed removal answers in plain language instead.
+  const { apply: applyPlugin } = await import(`${packageRoot}lib/index.js`)
+  const root = await mkdtemp(join(tmpdir(), 'dsd-leak-'))
+  t.after(() => chmod(target, 0o755).catch(() => {}))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const SID = 'session-unremovable-1'
+  const bucket = join(root, '--proj--')
+  const target = join(bucket, SID)
+  await mkdir(target, { recursive: true })
+  await writeFile(join(target, 'session.v4.jsonl.zstd'), 'log')
+  // Removing the directory's write bit makes the recursive unlink fail with
+  // EACCES, which is the shape a file held by another program takes on macOS.
+  await chmod(target, 0o500)
+
+  let handler
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: () => undefined,
+    emit() {},
+    effect(fn) { fn() },
+    async parallel() {},
+    inject(_names, fn) { fn(this) },
+    webServer: { register(route) { handler = route.handler; return () => {} } },
+  }
+  applyPlugin(ctx, { sessionsRoot: root })
+
+  const answer = await new Promise(resolve => {
+    const res = { statusCode: 200, setHeader() {}, end(text) { resolve({ status: this.statusCode, body: text }) } }
+    const req = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:8080' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ sessionId: SID })) },
+    }
+    handler(req, res)
+  })
+
+  const parsed = JSON.parse(answer.body)
+  assert.equal(parsed.ok, false)
+  assert.equal(parsed.code, 'DELETE_FAILED')
+  // No absolute path, no raw errno token, no file name.
+  assert.equal(answer.body.includes(root), false, `the message leaks the path: ${parsed.message}`)
+  assert.equal(/EACCES|EPERM|unlink|ENOENT/.test(parsed.message), false, parsed.message)
+  assert.match(parsed.message, /权限|出错/)
 })
