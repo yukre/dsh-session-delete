@@ -26,12 +26,17 @@ DSH 内置的 **归档 (Archive)** 与真正的 **删除 (Delete)** 是两件不
 
 ## 安全设计
 
+删除是不可逆操作，因此每一道闸门都是硬性的：
+
 - **必须在确认框中确认**：显示会话标题，并明确提示不可撤销、同时提示"只想隐藏请用归档"
-- **运行中的会话禁止删除**（`SESSION_RUNNING`），避免在日志仍被写入时删除导致损坏
-- **当前打开的会话禁止删除**（`SESSION_OPEN`），避免界面持有已消失的会话
-- **会话 ID 白名单校验**：只允许单段安全字符，拒绝 `..`、`/`、绝对路径
+- **运行中的会话禁止删除**（`SESSION_RUNNING`）：日志仍在被写入时删除会损坏数据。这里**不会**代你取消正在跑的任务——你明确要求过不打断工作，所以先停止再删是你的选择，不是插件的选择
+- **常驻但空闲的 Agent 会被先退役**：聊天机器人这类集成会为一个空闲会话长期保留 Agent。删除前先 `cancel`（`disposed` 原因）、等 `whenIdle()` 排干、再请各 provider 释放，最后才删目录——否则那个 Agent 会继续往已删路径写入，会话也会在内存表里变成"幽灵行"
+- **会话 ID 白名单校验**：只允许单段安全字符，拒绝 `..`、`/`、`\`、NUL、绝对路径
 - **路径越界防护**：解析后必须仍在会话根目录内
-- **同源校验**：要求 JSON Content-Type 且 Origin 与 Host 一致，跨站请求被拒
+- **目标必须是真会话目录**：候选目录必须含 `session.v4.jsonl.zstd` 或 `session.lock`。只按目录名匹配会把 `attachments`、`.git` 这类普通目录当成会话递归删掉
+- **有歧义就拒绝**（`AMBIGUOUS_LOCATION`）：同一 id 出现在两个 bucket 时不再"删第一个"，而是列出全部候选让你自己确认
+- **连接信任栅栏**（`UNTRUSTED_CONNECTION`）：`webServer.register` 不经过 DSH 的连接信任检查，所以路由自己做——Host 必须是回环地址（DNS 重绑定伪造不了 Host）、`Sec-Fetch-Site: cross-site` 拒绝、`Origin` 存在时必须与 Host 同源、`Origin: null` 拒绝。这是 `dsh-session-api` 在生产上跑过的同一套栅栏
+- **JSON Content-Type**：与信任栅栏相互独立，跨站表单无法设置它
 
 ## 删除的是什么
 
@@ -41,29 +46,35 @@ DSH 内置的 **归档 (Archive)** 与真正的 **删除 (Delete)** 是两件不
   session.lock            写入锁文件（无数据）
 ```
 
-删除即移除该会话目录。会话列表由扫描该目录树得出，因此删除后无需重建索引；Host 端还会发出 `api-session/removed` 通知，让侧栏立即移除该行。
+删除即移除该会话目录。会话列表由扫描该目录树得出，因此删除后无需重建索引。
 
-## 安装状态
+Host 端同时发出两个通知：
 
-已作为 bundle 安装进 `desktop` profile，并写入正式配置（`dsh.profile.bundles`）。
-
-- **Host 端（删除接口）**：已生效并实测通过
-- **Client 端（菜单入口）**：需**重启 DeepSeek Harness** 后才会出现在浏览器中
+- `api-session/removed`——DSH 自己的 UI 通知，让侧栏立即移除该行
+- `session-delete/removed`（载荷 `{ sessionId, paths }`）——本插件自有事件。集成方如果把会话 id 缓存在自己的文件里（例如聊天机器人把用户映射到会话），DSH 没有别的信号能让它知道这个 id 已经消失，订阅这个事件即可清理
 
 ## 验证记录
 
-Host 删除接口在真实运行环境中验证通过（使用独立测试目录，验证后已清理）：
+以下每一项都有对应的自动化测试（`npm test`，共 23 项），并且**先在旧代码上确认会失败、修复后再确认通过**：
 
 | 场景 | 结果 |
 |---|---|
 | 正常删除测试会话 | ✅ `200 {"ok":true,...}`，目录已移除 |
 | 不存在的会话 | ✅ `409 NOT_FOUND` |
-| 无 Origin 头 | ✅ `403 BAD_ORIGIN` |
-| 跨站 Origin | ✅ `403 BAD_ORIGIN` |
+| 运行中会话 | ✅ `409 SESSION_RUNNING`，且**不**取消该会话 |
+| 空闲常驻 Agent | ✅ 先 cancel → whenIdle → 释放，再删目录 |
 | 路径穿越 `../../etc` | ✅ `409 BAD_SESSION_ID` |
-| 非 JSON Content-Type | ✅ `403` |
+| 重绑定 Host | ✅ `403 UNTRUSTED_CONNECTION` |
+| 伪造 Origin + Host 同行 | ✅ `403 UNTRUSTED_CONNECTION`（Host 栅栏拦下） |
+| 跨站 Origin | ✅ `403 UNTRUSTED_CONNECTION` |
+| `Sec-Fetch-Site: cross-site` | ✅ `403 UNTRUSTED_CONNECTION` |
+| `Origin: null` | ✅ `403 UNTRUSTED_CONNECTION` |
+| 应用页面自身请求 | ✅ `200` |
+| 名字合法但非会话的目录（`attachments`、`.git`） | ✅ 不匹配，不删除 |
+| 同一 id 出现在两个 bucket | ✅ `409 AMBIGUOUS_LOCATION`，列出双方，都不删 |
+| 非 JSON Content-Type | ✅ `415 BAD_CONTENT_TYPE` |
 | GET 方法 | ✅ `405 METHOD_NOT_ALLOWED` |
-| 运行中会话 | ✅ `409 SESSION_RUNNING`，未删除 |
+
 
 ## 限制
 

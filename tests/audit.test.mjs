@@ -71,7 +71,7 @@ async function scenario(label, setup, opts = {}) {
     let done; const p = new Promise(r => done = r)
     const res = { statusCode: 200, setHeader() {}, end(t) { done({ status: this.statusCode, body: t }) } }
     const req = Readable.from([Buffer.from(JSON.stringify(body))])
-    req.method = 'POST'; req.headers = { 'content-type': 'application/json' }
+    req.method = 'POST'; req.headers = { 'content-type': 'application/json', host: '127.0.0.1:8080' }
     await handler(req, res)
     return p
   }
@@ -132,7 +132,7 @@ const exists = async p => { try { const { stat } = await import('node:fs/promise
     inject(_n, fn) { fn(mk()) }, webServer: { register(r) { handler = r.handler; return () => {} } } })
   mod.apply(mk(), { sessionsRoot: root })
   const call = async b => { let d; const p = new Promise(r => d = r); const res = { statusCode: 200, setHeader() {}, end(t) { d(t) } };
-    const req = Readable.from([Buffer.from(JSON.stringify(b))]); req.method = 'POST'; req.headers = { 'content-type': 'application/json' }; await handler(req, res); return p }
+    const req = Readable.from([Buffer.from(JSON.stringify(b))]); req.method = 'POST'; req.headers = { 'content-type': 'application/json', host: '127.0.0.1:8080' }; await handler(req, res); return p }
   console.log('\n─── 场景5 删空桶内唯一会话 ───')
   await call({ sessionId: 'session-only-1' })
   check('会话目录已删', !(await exists(join(root, '--only--', 'session-only-1'))))
@@ -141,9 +141,9 @@ const exists = async p => { try { const { stat } = await import('node:fs/promise
 }
 
 
-// 场景6：同一 id 出现在两个 bucket → 只删一个，另一个必须保留
+// 场景6：同一 id 出现在两个 bucket → 有歧义，拒绝删除（不擅自挑一个）
 {
-  console.log('\n─── 场景6 同名会话只删一个（不扩散）───')
+  console.log('\n─── 场景6 同名会话有歧义时拒绝删除（不扩散）───')
   const tmp = await mkdtemp(join(tmpdir(), 'dsd-dup-'))
   const root = join(tmp, 'sessions')
   const SID = 'session-dup-copy-0003'
@@ -174,18 +174,20 @@ const exists = async p => { try { const { stat } = await import('node:fs/promise
   let done; const p = new Promise(r => done = r)
   const res = { statusCode: 200, setHeader() {}, end(t) { done({ status: this.statusCode, body: t }) } }
   const req = Readable.from([Buffer.from(JSON.stringify({ sessionId: SID }))])
-  req.method = 'POST'; req.headers = { 'content-type': 'application/json' }
+  req.method = 'POST'; req.headers = { 'content-type': 'application/json', host: '127.0.0.1:8080' }
   await handler(req, res)
   const body = JSON.parse((await p).body)
 
   const aExists = await exists(join(root, BUCKET_A, SID))
   const bExists = await exists(join(root, BUCKET_B, SID))
-  check('只删了其中一个（另一个保留）', aExists !== bExists, `A=${aExists} B=${bExists}`)
-  check('确实有一个被删掉', !aExists || !bExists)
-  check('返回成功', body.ok === true, JSON.stringify(body))
-  check('报告了未处理的副本', Array.isArray(body.untouchedDuplicates) && body.untouchedDuplicates.length === 1, JSON.stringify(body))
-  check('记录了警告日志', warns.some(w => w.includes('other bucket') || w.includes('copies')), JSON.stringify(warns))
-  check('缓存已清理（按 id 清，与副本无关）', !(await exists(join(cacheDir, `${SID}.json`))))
+  // 新契约：两份都在、谁都不删，返回候选让用户自己选。
+  check('两份都保留了（不擅自挑一个）', aExists && bExists, `A=${aExists} B=${bExists}`)
+  check('返回歧义错误而非成功', body.ok === false && body.code === 'AMBIGUOUS_LOCATION', JSON.stringify(body))
+  check('报告了两份候选', Array.isArray(body.candidates) && body.candidates.length === 2, JSON.stringify(body))
+  check('记录了警告日志', warns.some(w => w.includes('copies') || w.includes('refusing')), JSON.stringify(warns))
+  // 删除没有发生，派生数据就必须原样保留。
+  check('缓存未被动过（删除未发生）', await exists(join(cacheDir, `${SID}.json`)))
+  check('账本未被动过（删除未发生）', tables.ws.sessionIds.includes(SID))
   await frm(tmp, { recursive: true, force: true })
 }
 
